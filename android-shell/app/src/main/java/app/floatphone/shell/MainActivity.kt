@@ -6,6 +6,8 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -25,6 +27,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -32,6 +35,12 @@ import androidx.core.view.WindowInsetsControllerCompat
 /**
  * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
  * 网页每次部署即时生效，本壳只负责原生能力（推送长连接、文件上下行、外链）。
+ *
+ * v2（2026-11-25）改动：
+ *  - 修复顶部不能全屏：setDecorFitsSystemWindows 改为 false，状态栏/导航栏透明，
+ *    窗口背景设为黑色，刘海屏 Android 11+ 用 ALWAYS 铺满
+ *  - 补键盘处理：decorFits=false 后 adjustResize 失效，改用 IME insets 给 WebView 加底部内边距
+ *  - 文件选择器：改用 FileChooserParams.parseResult，支持多选
  */
 class MainActivity : AppCompatActivity() {
 
@@ -50,8 +59,9 @@ class MainActivity : AppCompatActivity() {
     ) { result ->
         val callback = filePathCallback ?: return@registerForActivityResult
         filePathCallback = null
-        val data = result.data?.data
-        callback.onReceiveValue(if (data != null) arrayOf(data) else emptyArray())
+        // parseResult 同时处理单选、多选（clipData）和取消（返回 null）
+        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        callback.onReceiveValue(uris ?: emptyArray())
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
@@ -100,12 +110,21 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+
+        // —— 全屏关键：内容铺到系统栏下面，不再给状态栏留位置 ——
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        // 窗口底色设黑，避免任何露出的缝隙显示成灰/白条
+        window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
         // 刘海/挖孔屏区域也铺满
         if (Build.VERSION.SDK_INT >= 28) {
             val lp = window.attributes
             lp.layoutInDisplayCutoutMode =
-                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                if (Build.VERSION.SDK_INT >= 30)
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                else
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             window.attributes = lp
         }
         // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
@@ -113,7 +132,17 @@ class MainActivity : AppCompatActivity() {
         volumeControlStream = AudioManager.STREAM_MUSIC
 
         webView = WebView(this)
+        webView.setBackgroundColor(Color.BLACK)
         setContentView(webView)
+
+        // decorFitsSystemWindows=false 后 adjustResize 不再自动生效，
+        // 这里手动把键盘高度作为底部内边距，聊天输入框才不会被键盘挡住
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { v, insets ->
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            v.setPadding(0, 0, 0, ime.bottom)
+            insets
+        }
+
         applyImmersive()
 
         webView.settings.apply {
