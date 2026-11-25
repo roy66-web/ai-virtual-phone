@@ -173,16 +173,39 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // 诊断：每次返回手势弹出提示，显示 WebView 是否记录了历史
+        // 返回手势：小手机是单页应用，页面切换没有浏览器历史（canGoBack 恒为 false），
+        // 所以改为在页面左上角找返回箭头并点击；找不到（已在桌面）才退出到手机桌面。
+        val backJs = """
+            (function(){
+              function isClickable(n){
+                var t = n.tagName ? n.tagName.toLowerCase() : '';
+                if (t === 'button' || t === 'a' || t === 'svg' || t === 'img') return true;
+                if (n.getAttribute && n.getAttribute('role') === 'button') return true;
+                if (n.querySelector && n.querySelector('svg,img')) return true;
+                return window.getComputedStyle(n).cursor === 'pointer';
+              }
+              for (var y = 16; y <= 160; y += 8) {
+                for (var x = 16; x <= 64; x += 8) {
+                  var n = document.elementFromPoint(x, y);
+                  for (var d = 0; n && d < 6; d++, n = n.parentElement) {
+                    var r = n.getBoundingClientRect();
+                    if (r.width < 16 || r.width > 100 || r.height > 100) continue;
+                    if (!isClickable(n)) continue;
+                    n.click();
+                    return 'clicked';
+                  }
+                }
+              }
+              return 'none';
+            })()
+        """.trimIndent()
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                val idx = webView.copyBackForwardList().currentIndex
-                Toast.makeText(
-                    this@MainActivity,
-                    "back: canGoBack=${webView.canGoBack()} idx=$idx",
-                    Toast.LENGTH_LONG,
-                ).show()
-                if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                webView.evaluateJavascript(backJs) { result ->
+                    if (result == "\"clicked\"") return@evaluateJavascript
+                    if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                }
             }
         })
 
