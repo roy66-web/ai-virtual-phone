@@ -173,8 +173,15 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        // 诊断：每次返回手势弹出提示，显示 WebView 是否记录了历史
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                val idx = webView.copyBackForwardList().currentIndex
+                Toast.makeText(
+                    this@MainActivity,
+                    "back: canGoBack=${webView.canGoBack()} idx=$idx",
+                    Toast.LENGTH_LONG,
+                ).show()
                 if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
             }
         })
