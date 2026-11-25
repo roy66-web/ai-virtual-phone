@@ -26,6 +26,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 /**
  * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
@@ -82,16 +84,37 @@ class MainActivity : AppCompatActivity() {
         else -> emptyList()
     }
 
+    /** 沉浸式全屏：隐藏状态栏和底部导航条，从边缘滑动可临时唤出。 */
+    private fun applyImmersive() {
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applyImmersive()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, true)
+        // 刘海/挖孔屏区域也铺满
+        if (Build.VERSION.SDK_INT >= 28) {
+            val lp = window.attributes
+            lp.layoutInDisplayCutoutMode =
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = lp
+        }
         // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
         // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
         volumeControlStream = AudioManager.STREAM_MUSIC
 
         webView = WebView(this)
         setContentView(webView)
+        applyImmersive()
 
         webView.settings.apply {
             javaScriptEnabled = true
@@ -173,10 +196,32 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // 返回手势：小手机是单页应用，页面切换没有浏览器历史（canGoBack 恒为 false），
-        // 所以改为在页面左上角找返回箭头并点击；找不到（已在桌面）才退出到手机桌面。
+        // 返回手势：小手机是单页应用，页面切换没有浏览器历史（canGoBack 恒为 false）。
+        // 1) 先找最上层可见的「取消/关闭/Close/Cancel」按钮（弹窗）；
+        // 2) 再找页面左上角的返回箭头；
+        // 3) 都没有（已在桌面）才退出到手机桌面。
         val backJs = """
             (function(){
+              var labels = ['取消','关闭','Close','Cancel','×','✕','✖'];
+              var ariaOk = ['close','cancel','关闭','取消','返回','back'];
+              function onTop(el){
+                var r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return false;
+                var cx = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
+                var cy = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
+                var t = document.elementFromPoint(cx, cy);
+                return !!t && (t === el || el.contains(t));
+              }
+              var all = document.querySelectorAll('button,[role="button"],a,div,span');
+              for (var i = all.length - 1; i >= 0; i--) {
+                var el = all[i];
+                var txt = (el.children.length === 0 || el.tagName === 'BUTTON') ? (el.textContent || '').trim() : '';
+                var al = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                if (labels.indexOf(txt) >= 0 || ariaOk.indexOf(al) >= 0) {
+                  if (onTop(el)) { el.click(); return 'clicked'; }
+                }
+              }
               function isClickable(n){
                 var t = n.tagName ? n.tagName.toLowerCase() : '';
                 if (t === 'button' || t === 'a' || t === 'svg' || t === 'img') return true;
@@ -188,8 +233,8 @@ class MainActivity : AppCompatActivity() {
                 for (var x = 16; x <= 64; x += 8) {
                   var n = document.elementFromPoint(x, y);
                   for (var d = 0; n && d < 6; d++, n = n.parentElement) {
-                    var r = n.getBoundingClientRect();
-                    if (r.width < 16 || r.width > 100 || r.height > 100) continue;
+                    var r2 = n.getBoundingClientRect();
+                    if (r2.width < 16 || r2.width > 100 || r2.height > 100) continue;
                     if (!isClickable(n)) continue;
                     n.click();
                     return 'clicked';
