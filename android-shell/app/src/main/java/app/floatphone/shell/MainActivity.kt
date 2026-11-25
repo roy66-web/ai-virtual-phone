@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
 import android.media.AudioManager
 import android.net.Uri
@@ -22,6 +23,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +43,12 @@ import androidx.core.view.WindowInsetsControllerCompat
  *    窗口背景设为黑色，刘海屏 Android 11+ 用 ALWAYS 铺满
  *  - 补键盘处理：decorFits=false 后 adjustResize 失效，改用 IME insets 给 WebView 加底部内边距
  *  - 文件选择器：改用 FileChooserParams.parseResult，支持多选
+ *
+ * v3（2026-11-25）改动：
+ *  - 修复打字时键盘盖住输入框：v2 给 WebView 加 padding 没生效（WebView 不会因 padding 缩小视口），
+ *    改成外面包一层 FrameLayout，键盘弹出时调 WebView 的 bottomMargin，页面视口真正变矮
+ *  - 键盘高度双保险：同时读 IME insets 和 getWindowVisibleDisplayFrame，取较大值，
+ *    兼容隐藏系统栏后 insets 不上报键盘的机型
  */
 class MainActivity : AppCompatActivity() {
 
@@ -53,6 +61,40 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    // 键盘高度（两个来源取较大值）
+    private var imeFromInsets = 0
+    private var imeFromLayout = 0
+
+    private fun applyKeyboardInset() {
+        val h = maxOf(imeFromInsets, imeFromLayout)
+        val lp = webView.layoutParams as FrameLayout.LayoutParams
+        if (lp.bottomMargin != h) {
+            lp.bottomMargin = h
+            webView.layoutParams = lp
+        }
+    }
+
+    private fun setupKeyboardInset(container: FrameLayout) {
+        // 来源 1：系统上报的 IME insets
+        ViewCompat.setOnApplyWindowInsetsListener(container) { _, insets ->
+            imeFromInsets =
+                if (insets.isVisible(WindowInsetsCompat.Type.ime()))
+                    insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+                else 0
+            applyKeyboardInset()
+            insets
+        }
+        // 来源 2：窗口可见区域（沉浸式隐藏系统栏后，部分机型不上报 IME insets，靠这个兜底）
+        container.viewTreeObserver.addOnGlobalLayoutListener {
+            val r = Rect()
+            container.getWindowVisibleDisplayFrame(r)
+            val screenH = container.rootView.height
+            val diff = screenH - r.bottom
+            imeFromLayout = if (screenH > 0 && diff > screenH * 0.15f) diff else 0
+            applyKeyboardInset()
+        }
+    }
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -131,17 +173,23 @@ class MainActivity : AppCompatActivity() {
         // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
         volumeControlStream = AudioManager.STREAM_MUSIC
 
+        // 外面包一层容器：键盘弹出时调整 WebView 的 bottomMargin，让网页视口真正变矮，
+        // 底部的聊天输入框才会被顶到键盘上方
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        val container = FrameLayout(this)
+        container.setBackgroundColor(Color.BLACK)
         webView = WebView(this)
         webView.setBackgroundColor(Color.BLACK)
-        setContentView(webView)
-
-        // decorFitsSystemWindows=false 后 adjustResize 不再自动生效，
-        // 这里手动把键盘高度作为底部内边距，聊天输入框才不会被键盘挡住
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { v, insets ->
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            v.setPadding(0, 0, 0, ime.bottom)
-            insets
-        }
+        container.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        setContentView(container)
+        setupKeyboardInset(container)
+        ViewCompat.requestApplyInsets(container)
 
         applyImmersive()
 
