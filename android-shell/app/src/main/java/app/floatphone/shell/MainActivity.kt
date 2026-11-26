@@ -3,6 +3,7 @@ package app.floatphone.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
@@ -49,15 +51,58 @@ import androidx.core.view.WindowInsetsControllerCompat
  *    改成外面包一层 FrameLayout，键盘弹出时调 WebView 的 bottomMargin，页面视口真正变矮
  *  - 键盘高度双保险：同时读 IME insets 和 getWindowVisibleDisplayFrame，取较大值，
  *    兼容隐藏系统栏后 insets 不上报键盘的机型
+ *
+ * v4（2026-11-26）改动：
+ *  - 修复备份/导出没反应：网页用 <a download href="blob:..."> 导出，WebView 默认不处理 blob，
+ *    现在每次页面加载后注入脚本拦截这类点击，每次只读 3MB 分片交给原生写进手机「下载」文件夹，
+ *    几百 MB 的备份也不会撑爆内存
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.0"
+        const val VERSION = "1.0.1"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
+
+    /**
+     * 导出拦截脚本：网页导出文件都是 a.href=blob:... + a.download=文件名 + a.click()。
+     * WebView 不会处理 blob 下载，这里改成每次只读 3MB，分块交给 AndroidShell.saveXxx 写到「下载」，
+     * 内存占用固定，几百 MB 的备份也不会撑爆网页进程。
+     */
+    private val exportJs = """
+        (function(){
+          if (window.__mioDl) return;
+          window.__mioDl = 1;
+          var oc = HTMLAnchorElement.prototype.click;
+          var SLICE = 3 * 1024 * 1024;
+          function part(blob, from){
+            return new Promise(function(ok, bad){
+              var fr = new FileReader();
+              fr.onerror = function(){ bad(fr.error); };
+              fr.onload = function(){ var s = String(fr.result); ok(s.slice(s.indexOf(',') + 1)); };
+              fr.readAsDataURL(blob.slice(from, from + SLICE));
+            });
+          }
+          async function send(name, blob){
+            AndroidShell.saveBegin(name, blob.type || 'application/octet-stream');
+            for (var p = 0; p < blob.size; p += SLICE) AndroidShell.saveChunk(await part(blob, p));
+            AndroidShell.saveEnd();
+          }
+          HTMLAnchorElement.prototype.click = function(){
+            var a = this, h = a.href || '';
+            if (a.hasAttribute('download') && /^(blob:|data:)/.test(h) && window.AndroidShell && AndroidShell.saveBegin) {
+              var name = a.getAttribute('download') || 'export';
+              fetch(h).then(function(r){ return r.blob(); })
+                .then(function(b){ return send(name, b); })
+                .catch(function(){ try { AndroidShell.saveAbort(); } catch (e) {} });
+              return;
+            }
+            return oc.apply(this, arguments);
+          };
+        })()
+    """.trimIndent()
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -207,6 +252,11 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(ShellBridge(), "AndroidShell")
 
         webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                view.evaluateJavascript(exportJs, null)
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val url = request.url
                 val scheme = url.scheme ?: return false
@@ -372,6 +422,86 @@ class MainActivity : AppCompatActivity() {
     inner class ShellBridge {
         @JavascriptInterface
         fun getVersion(): String = VERSION
+
+        // —— 导出文件落到「下载」文件夹（分块接收，避免一次传大字符串）——
+        private var dlOut: java.io.OutputStream? = null
+        private var dlUri: Uri? = null
+        private var dlName = ""
+
+        private fun saveCloseQuietly() {
+            runCatching { dlOut?.close() }
+            dlOut = null
+            dlUri = null
+        }
+
+        @JavascriptInterface
+        @Synchronized
+        fun saveBegin(name: String, mime: String) {
+            saveCloseQuietly()
+            val safe = name.replace(Regex("[/\\\\:*?\"<>|]"), "_").ifBlank { "export" }
+            dlName = safe
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, safe)
+                        put(MediaStore.Downloads.MIME_TYPE, mime)
+                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("insert failed")
+                    dlUri = uri
+                    dlOut = contentResolver.openOutputStream(uri)
+                } else {
+                    val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+                    dir.mkdirs()
+                    dlOut = java.io.FileOutputStream(java.io.File(dir, safe))
+                }
+            } catch (e: Exception) {
+                saveCloseQuietly()
+                runOnUiThread { Toast.makeText(this@MainActivity, "导出失败：无法创建文件", Toast.LENGTH_LONG).show() }
+            }
+        }
+
+        @JavascriptInterface
+        @Synchronized
+        fun saveChunk(b64: String) {
+            val out = dlOut ?: return
+            try {
+                out.write(android.util.Base64.decode(b64, android.util.Base64.DEFAULT))
+            } catch (e: Exception) {
+                saveCloseQuietly()
+                runOnUiThread { Toast.makeText(this@MainActivity, "导出失败：写入出错", Toast.LENGTH_LONG).show() }
+            }
+        }
+
+        @JavascriptInterface
+        @Synchronized
+        fun saveAbort() {
+            val uri = dlUri
+            saveCloseQuietly()
+            if (uri != null) runCatching { contentResolver.delete(uri, null, null) }
+            runOnUiThread { Toast.makeText(this@MainActivity, "导出中断，没有保存", Toast.LENGTH_LONG).show() }
+        }
+
+        @JavascriptInterface
+        @Synchronized
+        fun saveEnd() {
+            if (dlOut == null) return
+            val uri = dlUri
+            val name = dlName
+            runCatching { dlOut?.flush() }
+            saveCloseQuietly()
+            if (Build.VERSION.SDK_INT >= 29 && uri != null) {
+                runCatching {
+                    val v = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                    contentResolver.update(uri, v, null, null)
+                }
+            }
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "已保存到「下载」文件夹：" + name, Toast.LENGTH_LONG).show()
+            }
+        }
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
